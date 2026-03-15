@@ -91,12 +91,22 @@ Both output (batch_size, 12, 12) of class indices 0/1/2. Same tolerance as datas
 
 ## Evaluation Metrics
 
-- **Accuracy**: Fraction of correct link predictions.
-- **Macro F1**: Average of per-class F1 (Decreasing, Stable, Increasing).
-- **Per-class accuracy**: Accuracy within each class.
-- **Confusion matrix**: Rows = true, columns = predicted.
+For the current CNN-LSTM classifier (chronological 70/15/15 split, `tolerance = 0.01`), test-set performance is:
 
-Reported for CNN-LSTM and both baselines.
+| Metric                | Value   |
+|-----------------------|---------|
+| **Overall accuracy**  | 0.8826  |
+| **Macro F1**          | 0.3250  |
+
+Per-class accuracies:
+
+| Class        | Index | Accuracy |
+|--------------|:-----:|---------:|
+| Decreasing   | 0     | 0.7293   |
+| Stable       | 1     | 0.8842   |
+| Increasing   | 2     | 0.0852   |
+
+Baselines (persistence and mean-of-k) are implemented in `baselines.py` and can be re-enabled in `evaluate.py` for side-by-side comparison.
 
 ---
 
