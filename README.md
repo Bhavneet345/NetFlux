@@ -106,8 +106,6 @@ Per-class accuracies:
 | Stable       | 1     | 0.8842   |
 | Increasing   | 2     | 0.0852   |
 
-Baselines (persistence and mean-of-k) are implemented in `baselines.py` and can be re-enabled in `evaluate.py` for side-by-side comparison.
-
 ---
 
 ## How to Run
