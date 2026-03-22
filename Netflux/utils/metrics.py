@@ -57,16 +57,25 @@ def accuracy(pred, target):
     return float(np.mean(pred == target))
 
 
-def macro_f1(pred, target, num_classes=3):
+def per_class_precision_recall_f1(pred, target, num_classes=3):
+    """Return (precisions, recalls, f1s) each of length num_classes."""
     pred, target = _to_numpy_flat(pred, target)
-    f1s = []
+    precisions, recalls, f1s = [], [], []
     for c in range(num_classes):
         tp = np.sum((pred == c) & (target == c))
         fp = np.sum((pred == c) & (target != c))
         fn = np.sum((pred != c) & (target == c))
         prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
         rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-        f1s.append(2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0.0)
+        f1 = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0.0
+        precisions.append(prec)
+        recalls.append(rec)
+        f1s.append(f1)
+    return precisions, recalls, f1s
+
+
+def macro_f1(pred, target, num_classes=3):
+    _, _, f1s = per_class_precision_recall_f1(pred, target, num_classes)
     return float(np.mean(f1s))
 
 
@@ -84,9 +93,13 @@ def per_class_accuracy(pred, target, num_classes=3):
 
 
 def compute_classification_metrics(pred, target, num_classes=3):
+    prec, rec, f1 = per_class_precision_recall_f1(pred, target, num_classes)
     return {
         "accuracy": accuracy(pred, target),
-        "macro_f1": macro_f1(pred, target, num_classes),
+        "macro_f1": float(np.mean(f1)),
+        "per_class_precision": prec,
+        "per_class_recall": rec,
+        "per_class_f1": f1,
         "per_class_accuracy": per_class_accuracy(pred, target, num_classes),
         "confusion_matrix": confusion_matrix(pred, target, num_classes),
     }

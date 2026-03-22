@@ -18,6 +18,8 @@ from config import (
     WINDOW_SIZE,
     MATRIX_SIZE,
     TOLERANCE,
+    LABEL_MODE,
+    EPSILON,
     set_seed,
 )
 from utils.scaler import TrafficScaler
@@ -57,18 +59,61 @@ def load_abilene_matrices(data_dir: Optional[Path] = None) -> np.ndarray:
     return np.stack(rows, axis=0)
 
 
-def compute_labels(M_curr: np.ndarray, M_next: np.ndarray, tolerance: float) -> np.ndarray:
+def aggregate_matrices(data: np.ndarray, steps: int) -> np.ndarray:
+    """
+    Temporal aggregation: average every `steps` consecutive matrices.
+    (T, 12, 12) -> (T//steps, 12, 12). With 5-min raw data, steps=6 -> 30-min resolution.
+    """
+    if steps <= 1:
+        return data
+    t = data.shape[0]
+    t_new = t // steps
+    return data[: t_new * steps].reshape(t_new, steps, *data.shape[1:]).mean(axis=1).astype(np.float32)
+
+
+def compute_labels(
+    M_curr: np.ndarray,
+    M_next: np.ndarray,
+    tolerance: float,
+    relative: bool = False,
+    epsilon: float = 1e-9,
+) -> np.ndarray:
     """
     Compute per-link class labels for transition from M_curr (t) to M_next (t+1).
-    Labels correspond to timestamp t+1.
     0 = Decreasing, 1 = Stable, 2 = Increasing.
-    M_curr, M_next: (12, 12). Returns (12, 12) int64.
+
+    When relative=True, tolerance is a fraction (e.g. 0.05 = 5%) and the
+    comparison uses per-link percentage change: delta / (|M_curr| + epsilon).
     """
     delta = M_next - M_curr
+    if relative:
+        delta = delta / (np.abs(M_curr) + epsilon)
     labels = np.ones_like(M_curr, dtype=np.int64)  # Stable by default
     labels[delta > tolerance] = 2   # Increasing
     labels[delta < -tolerance] = 0  # Decreasing
     return labels
+
+
+def get_class_distribution(
+    data: np.ndarray,
+    tolerance: float,
+    num_classes: int = 3,
+    relative: bool = False,
+    epsilon: float = 1e-9,
+) -> Tuple[Tuple[int, ...], Tuple[float, ...]]:
+    """
+    Compute class distribution over all consecutive pairs in data.
+    data: (T, 12, 12). Uses transitions t -> t+1 for t in 0..T-2.
+    Returns (counts, percentages) where counts and percentages are length num_classes.
+    """
+    counts = [0] * num_classes
+    for t in range(data.shape[0] - 1):
+        labels = compute_labels(data[t], data[t + 1], tolerance, relative=relative, epsilon=epsilon)
+        for c in range(num_classes):
+            counts[c] += int((labels == c).sum())
+    total = sum(counts)
+    pcts = tuple((counts[c] / total * 100.0) if total > 0 else 0.0 for c in range(num_classes))
+    return tuple(counts), pcts
 
 
 class TrafficMatrixDataset(Dataset):
@@ -85,20 +130,37 @@ class TrafficMatrixDataset(Dataset):
         tolerance: float = TOLERANCE,
         classification: bool = True,
         scaler: Optional[TrafficScaler] = None,
+        relative: bool = (LABEL_MODE == "relative"),
+        epsilon: float = EPSILON,
     ) -> None:
         """
         Args:
             data: (T, 12, 12) array, chronologically ordered.
             window_size: number of past matrices (k).
-            tolerance: for classification, |delta| <= tolerance -> Stable (in same units as data).
+            tolerance: threshold for classification (fraction when relative=True, absolute otherwise).
             classification: if True, target is (12, 12) int labels; else (12, 12) float.
             scaler: optional; only for regression; transform seq and target.
+            relative: if True, use per-link percentage change for labeling.
+            epsilon: div-by-zero protection for relative mode.
         """
         self.data = data
         self.window_size = window_size
         self.tolerance = tolerance
         self.classification = classification
         self.scaler = scaler
+        self.relative = relative
+        self.epsilon = epsilon
+
+        # Data-relative denominator floor for percentage changes:
+        # 1% of the 10th percentile of non-zero values in the dataset.
+        if relative:
+            nonzero = data[data > 0]
+            if len(nonzero) > 0:
+                self.pct_floor = float(np.percentile(nonzero, 10) * 0.01)
+            else:
+                self.pct_floor = epsilon
+        else:
+            self.pct_floor = epsilon
         self.T = data.shape[0]
         if classification:
             # Need M[t] and M[t+1]; t from window_size to T-2
@@ -114,8 +176,15 @@ class TrafficMatrixDataset(Dataset):
         seq = self.data[t - self.window_size : t].copy()  # (k, 12, 12)
 
         if self.classification:
-            # Target: labels for transition t -> t+1
-            target = compute_labels(self.data[t], self.data[t + 1], self.tolerance)
+            target = compute_labels(
+                self.data[t], self.data[t + 1], self.tolerance,
+                relative=self.relative, epsilon=self.epsilon,
+            )
+            if self.relative:
+                # Feed percentage changes instead of raw values: (k-1, 12, 12)
+                # pct_floor is data-relative: 1% of 10th-percentile non-zero traffic
+                seq = np.diff(seq, axis=0) / (np.abs(seq[:-1]) + self.pct_floor)
+                np.clip(seq, -3.0, 3.0, out=seq)
             if self.scaler is not None:
                 seq = self.scaler.transform(seq)
             return (

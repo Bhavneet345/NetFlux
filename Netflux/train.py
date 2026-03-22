@@ -1,6 +1,7 @@
 """
-Training script for CNN-LSTM link-trend classification.
-Predict per-link trend (Decreasing / Stable / Increasing). CrossEntropyLoss, Adam, early stopping.
+Training script for per-link LSTM link-trend classification.
+Predict per-link trend (Decreasing / Stable / Increasing).
+CrossEntropyLoss with optional class weights, Adam + weight decay, grad clipping, early stopping.
 """
 
 from pathlib import Path
@@ -20,14 +21,16 @@ from config import (
     BATCH_SIZE,
     EPOCHS,
     LEARNING_RATE,
+    WEIGHT_DECAY,
     EARLY_STOPPING_PATIENCE,
     TOLERANCE,
     NUM_CLASSES,
     CLASS_WEIGHTS,
+    AGGREGATION_STEPS,
     CHECKPOINT_DIR,
     OUTPUT_DIR,
 )
-from dataset import load_abilene_matrices, chronological_split, TrafficMatrixDataset
+from dataset import load_abilene_matrices, aggregate_matrices, chronological_split, TrafficMatrixDataset
 from models.cnn_lstm import get_classifier
 from utils.visualization import plot_training_curves
 
@@ -38,6 +41,11 @@ def main() -> None:
     print(f"Using device: {device}")
 
     data = load_abilene_matrices()
+    data = aggregate_matrices(data, AGGREGATION_STEPS)
+    print(
+        f"Temporal aggregation: {AGGREGATION_STEPS}x (5 min × {AGGREGATION_STEPS} = "
+        f"{5 * AGGREGATION_STEPS} min) -> T={data.shape[0]}"
+    )
     train_data, val_data, test_data = chronological_split(
         data, TRAIN_RATIO, VAL_RATIO, TEST_RATIO
     )
@@ -57,26 +65,41 @@ def main() -> None:
     )
     val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
 
-    # Class weights for imbalanced labels (Decreasing/Stable/Increasing)
+    CLASS_NAMES = ["Decreasing", "Stable", "Increasing"]
+    class_counts = [0] * NUM_CLASSES
+    for _, target in train_ds:
+        for c in range(NUM_CLASSES):
+            class_counts[c] += int((target.numpy() == c).sum())
+    total_samples = sum(class_counts)
+
+    print("Class distribution:")
+    for c, name in enumerate(CLASS_NAMES):
+        print(f"  {name}: {class_counts[c]}")
+
     if CLASS_WEIGHTS == "balanced":
-        class_counts = [0] * NUM_CLASSES
-        for _, target in train_ds:
-            for c in range(NUM_CLASSES):
-                class_counts[c] += (target.numpy() == c).sum()
-        total = sum(class_counts)
-        # weight_c = n_total / (n_classes * n_c); then normalize so mean weight = 1
         weights = [
-            total / (NUM_CLASSES * (class_counts[c] + 1e-6)) for c in range(NUM_CLASSES)
+            total_samples / (NUM_CLASSES * (class_counts[c] + 1e-6))
+            for c in range(NUM_CLASSES)
         ]
         weight_tensor = torch.tensor(weights, dtype=torch.float32, device=device)
         weight_tensor = weight_tensor / weight_tensor.mean()
-        print(f"Class counts (train): {class_counts} -> weights: {[f'{w:.4f}' for w in weight_tensor.cpu().tolist()]}")
+        print("Class weights (normalized, mean=1):")
+        for c, name in enumerate(CLASS_NAMES):
+            print(f"  {name}: {weight_tensor[c].item():.4f}")
         criterion = nn.CrossEntropyLoss(weight=weight_tensor)
     else:
         criterion = nn.CrossEntropyLoss()
 
+    print("-" * 40)
     model = get_classifier(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Model parameters: {total_params:,}")
+
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=LEARNING_RATE,
+        weight_decay=WEIGHT_DECAY,   # L2 regularization
+    )
 
     CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -93,9 +116,11 @@ def main() -> None:
         for seq, target in train_loader:
             seq, target = seq.to(device), target.to(device)
             optimizer.zero_grad()
-            logits = model(seq)  # (B, 3, 12, 12)
+            logits = model(seq)
             loss = criterion(logits, target)
             loss.backward()
+            # Gradient clipping — prevents exploding gradients in LSTM
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             epoch_train_loss += loss.item()
             n_batches += 1

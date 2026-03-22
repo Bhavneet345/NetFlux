@@ -1,64 +1,103 @@
 # NetFlux: Learning Temporal Structure in Backbone Traffic
 
-NetFlux is a baseline **link-trend classification** suite for backbone network traffic. Given a sliding window of past 12×12 matrices, the model predicts for each link (i, j) whether traffic will be **Decreasing**, **Stable**, or **Increasing** at the next timestep.
+NetFlux is a **link-trend classification** pipeline for backbone traffic matrices. Given a sliding window of past 12×12 matrices, the model predicts for each link (i, j) whether traffic will be **Decreasing**, **Stable**, or **Increasing** at the next timestep.
 
 ---
 
 ## Project Overview
 
-This repository implements:
+This repository (`Netflux/`) implements:
 
 - **Data loading** from raw Abilene 2004 `.dat` files or a preprocessed `(T, 12, 12)` NumPy array
-- **Sliding-window** sequence generation; targets are **per-link class labels** (0/1/2)
-- **Baseline predictors**: persistence (label from M[t-1] vs M[t]) and mean (label from mean(last k) vs M[t])
-- **CNN-LSTM classifier**: spatial CNN per timestep, LSTM over time, FC to 3 classes per link
-- **Training** with CrossEntropyLoss, Adam optimizer, early stopping on validation loss
-- **Evaluation** with accuracy, macro F1, per-class accuracy, and confusion matrix
+- **Temporal aggregation** (optional): average consecutive raw snapshots to 30-minute resolution (see `AGGREGATION_STEPS` below)
+- **Sliding-window** sequences; targets are **per-link class labels** (0/1/2)
+- **Per-Link LSTM classifier** (not a spatial CNN): each of 144 links is a 1-D time series; a shared LSTM + small input projection predicts 3 classes per link
+- **Relative labeling & inputs**: percentage-change tolerance, percentage-change features with `pct_floor` and clipping (see `dataset.py`)
+- **Training**: CrossEntropyLoss with balanced class weights, Adam (`weight_decay`), gradient clipping, early stopping on validation loss
+- **Evaluation**: accuracy, macro F1, per-class F1, precision, recall, confusion matrix
 
-The code is modular and suitable for extending to PCA, RPCA, Transformer, or GNN-based models.
+---
+
+## Configuration snapshot (`config.py`)
+
+Values below are the single source of truth; update this table when you change `config.py`.
+
+| Setting | Value | Notes |
+|--------|-------|--------|
+| `MATRIX_SIZE` | 12 | 12×12 traffic matrix |
+| `WINDOW_SIZE` | **10** | 10 matrices of history; with 30-min aggregation ≈ **5 hours** of context |
+| `AGGREGATION_STEPS` | **6** | 5 min × 6 = **30-minute** timesteps; set to `1` for raw 5-minute data |
+| `LABEL_MODE` | `"relative"` | Per-link % change vs `|M_curr| + ε` |
+| `TOLERANCE` | **0.1** | **10%** relative change → Stable band |
+| `EPSILON` | `1e-9` | Denominator floor in relative formulas |
+| `CLASS_WEIGHTS` | `"balanced"` | Inverse-frequency weights in CrossEntropyLoss |
+| `LSTM_HIDDEN_SIZE` | **128** | Per-link LSTM hidden size |
+| `LSTM_NUM_LAYERS` | 2 | Stacked LSTM |
+| `DROPOUT` | **0.3** | On LSTM (between layers) and before classifier |
+| `BATCH_SIZE` | 128 | |
+| `EPOCHS` | 100 | (may stop earlier) |
+| `LEARNING_RATE` | **3e-4** | Adam |
+| `WEIGHT_DECAY` | 1e-4 | L2 on Adam |
+| `EARLY_STOPPING_PATIENCE` | **15** | Validation loss |
+| `TRAIN_RATIO` / `VAL_RATIO` / `TEST_RATIO` | 0.70 / 0.15 / 0.15 | Chronological, no shuffle |
+| `SEED` | 42 | Reproducibility |
+
+**Relative mode inputs:** After aggregation, each sample uses `WINDOW_SIZE` raw matrices in the window; the dataset converts them to **percentage-change frames** along time (`WINDOW_SIZE - 1` frames, e.g. **9** when `WINDOW_SIZE = 10`).
 
 ---
 
 ## Dataset Description
 
 - **Source**: Abilene 2004 Internet2 traffic matrix (ingress/egress, router-level)
-- **Location**: `DATA` = `../Datasets/Abilene/2004` (relative to project root)
+- **Location**: `../Datasets/Abilene/2004` relative to `Netflux/` (see `DATA_DIR` / `MEASURED_DIR` in `config.py`)
 - **Format**: Either
-  - Raw: `Measured/tm.YYYY-MM-DD.HH-MM-SS.dat` (one 12×12 matrix per file, comma-separated, header lines starting with `#`), or
-  - Preprocessed: NumPy array of shape `(T, 12, 12)` saved as `data/abilene_2004_Tx12x12.npy`
-- **Temporal resolution**: 5-minute intervals
+  - Raw: `Measured/tm.YYYY-MM-DD.HH-MM-SS.dat` (one 12×12 matrix per file, comma-separated, lines starting with `#` are comments), or
+  - Preprocessed: `Netflux/data/abilene_2004_Tx12x12.npy` with shape `(T, 12, 12)`
+- **Raw temporal resolution**: 5-minute intervals
+- **Effective resolution for training/eval** (default): **30 minutes** after `aggregate_matrices(..., AGGREGATION_STEPS=6)`
 - **Assumptions**: Chronologically ordered; no missing timestamps
 
 ---
 
 ## Classification Formulation
 
-- **Why classification**: We predict the **trend** of each link (Decreasing / Stable / Increasing) instead of raw values. Useful for anomaly detection and interpretable alerts; reduces sensitivity to scale.
-- **Label definition**: For link (i,j), T_ij = M[t][i][j], T_next = M[t+1][i][j]. With `tolerance` (default 0.01 Gbytes/s): **Stable (1)** if |T_next - T_ij| <= tolerance; **Increasing (2)** if T_next - T_ij > tolerance; **Decreasing (0)** else. Labels correspond to timestamp t+1.
-- **Threshold role**: Defines what counts as "no change." Smaller tolerance makes Stable rarer; larger merges small fluctuations into Stable.
-- **Evaluation**: Accuracy, macro F1, per-class accuracy, confusion matrix (no inverse-transform).
+- **Why classification**: We predict each link’s **trend** (Decreasing / Stable / Increasing) instead of raw values — useful for alerts and interpretability.
+- **Label definition (relative mode, default):** For each link, \(\Delta = (M_{next} - M_{curr}) / (|M_{curr}| + \epsilon)\). With **`TOLERANCE = 0.1` (10%)**:
+  - **Stable (1)** if \(|\Delta| \le \text{TOLERANCE}\)
+  - **Increasing (2)** if \(\Delta > \text{TOLERANCE}\)
+  - **Decreasing (0)** if \(\Delta < -\text{TOLERANCE}\)
+- **Absolute mode** (if `LABEL_MODE = "absolute"`): same structure but \(\Delta = M_{next} - M_{curr}\) and `TOLERANCE` is in the same units as traffic.
+- **Evaluation**: Accuracy, macro F1, per-class F1, precision, recall, confusion matrix.
 
 ---
 
 ## Problem Formulation
 
-- **Input**: A sequence of k past traffic matrices (shape k x 12 x 12).
-- **Output**: A 12×12 matrix of **class labels** (0, 1, or 2) for the next timestep.
-- **Objective**: Minimize cross-entropy; maximize accuracy and macro F1. This is **classification**: 144 independent 3-way classifications (one per link).
+- **Input**: A sequence of `WINDOW_SIZE` past matrices → in relative mode, **percentage-change** tensor of shape **`(WINDOW_SIZE - 1, 12, 12)`** per sample.
+- **Output**: A 12×12 matrix of class labels (0, 1, 2) for the transition to the next timestep.
+- **Objective**: Minimize weighted cross-entropy; report accuracy and macro F1. **144** independent 3-way decisions per sample (one per link).
 
 ---
 
 ## Sliding Window Strategy
 
-- For each t with t+1 available: **Sequence** = M[t-k], ..., M[t-1] (k x 12 x 12); **Target** = label matrix for t to t+1 (12 x 12, values 0/1/2). Number of samples: T - k - 1. Data split **chronologically** (70% / 15% / 15%).
+- For each valid index: sequence ends at \(t\); target is the label matrix for \(t \to t+1\).
+- **Number of classification samples:** \(T - \text{WINDOW\_SIZE} - 1\) (per split), where \(T\) is the length of that split **after** aggregation.
+- **Split:** Chronological **70% / 15% / 15%** (train / val / test).
 
 ---
 
-## Model Architecture (CNN-LSTM Classifier)
+## Model Architecture (Per-Link LSTM)
 
-1. **CNN encoder** (per timestep): Two 2D conv layers to spatial feature vector.
-2. **LSTM** over the sequence; use last hidden state.
-3. **Fully connected**: 144*3 logits, reshape to (batch_size, 3, 12, 12). No softmax (CrossEntropyLoss expects logits). **Input**: (batch_size, k, 12, 12). **Output**: (batch_size, 3, 12, 12).
+Implemented in `models/cnn_lstm.py` as `PerLinkLSTM` (also exported as `CNNLSTMClassifier` for compatibility).
+
+1. **Reshape** `(B, T, 12, 12)` → `(B×144, T, 1)` so each link is its own batch item.
+2. **Input projection:** `Linear(1 → 16)`, `LayerNorm`, `tanh`.
+3. **LSTM:** `LSTM_NUM_LAYERS` layers, hidden size `LSTM_HIDDEN_SIZE` (**128**), `batch_first=True`, dropout between layers when `num_layers > 1`.
+4. **Last timestep** → `Dropout` → `Linear(hidden → 3)` per link.
+5. **Reshape** logits to `(B, 3, 12, 12)` for `CrossEntropyLoss`.
+
+There is **no** spatial CNN over the 12×12 grid; neighbors in the matrix are not treated as image pixels.
 
 ---
 
@@ -69,61 +108,50 @@ The code is modular and suitable for extending to PCA, RPCA, Transformer, or GNN
 | **Persistence** | Label from M[t-1] vs M[t] (last two in window) |
 | **Mean** | Label from mean(last k) vs M[t] |
 
-Both output (batch_size, 12, 12) of class indices 0/1/2. Same tolerance as dataset.
+Same tolerance / label mode as the dataset when you run them with shared config.
 
 ---
 
 ## Training Procedure
 
-- **Loss**: CrossEntropyLoss (targets long, logits from model). **Optimizer**: Adam. **Split**: 70% / 15% / 15% chronological. **Early stopping**: Validation loss. Best model saved to `checkpoints/best_cnn_lstm.pt`. No scaling for classification; labels from raw traffic with `tolerance` in Gbytes/s.
+- **Loss:** `CrossEntropyLoss` with **balanced** class weights (normalized to mean 1).
+- **Optimizer:** Adam, **`LEARNING_RATE`**, **`WEIGHT_DECAY`**.
+- **Gradient clipping:** max norm **1.0** (see `train.py`).
+- **Early stopping:** validation loss, patience **`EARLY_STOPPING_PATIENCE`**.
+- **Checkpoint:** `checkpoints/best_cnn_lstm.pt`.
+- **Data pipeline:** Load matrices → **`aggregate_matrices`** if `AGGREGATION_STEPS > 1` → chronological split → `TrafficMatrixDataset`.
 
 ---
 
-## Data Scaling Strategy
+## Data Scaling (classification path)
 
-- **Why scaling**: Traffic values (Gbytes/s) vary by orders of magnitude across OD pairs; standardization stabilizes training and improves convergence.
-- **Train-only fitting**: μ and σ are computed **only on the training split**. Validation and test data are transformed using these same parameters. Fitting on the full dataset would leak future/test information and inflate metrics.
-- **Per-element statistics**: We use per-element (12×12) mean and standard deviation, so each matrix entry has its own μ and σ. A small epsilon is added to σ to avoid divide-by-zero.
-- **Inverse-transform at evaluation**: Model and baselines predict in **scaled space**. Predictions (and targets) are inverse-transformed before computing MSE, RMSE, and MAE, so **all reported metrics are in original units (Gbytes/s)** and remain interpretable.
-- **Reproducibility**: The fitted scaler (μ, σ) is saved to `checkpoints/scaler.npz` and loaded by `evaluate.py`, ensuring identical scaling at inference.
+For **classification**, the model uses **aggregated raw traffic** inside the dataset to build **relative** percentage-change inputs and labels. Standardization (`scaler.npz`) applies to **regression** workflows if used elsewhere; the default classification training path does **not** require fitting a scaler for the tensors described above.
 
 ---
 
 ## Evaluation Metrics
 
-For the current CNN-LSTM classifier (chronological 70/15/15 split, `tolerance = 0.01`), test-set performance is:
+Run `evaluate.py` after training. Metrics are written to **`outputs/test_metrics.txt`** and printed to the console. Exact numbers depend on your run, seed, and checkpoint.
 
-| Metric                | Value   |
-|-----------------------|---------|
-| **Overall accuracy**  | 0.8826  |
-| **Macro F1**          | 0.3250  |
+Example **historical** test-set numbers (5-minute data, earlier setup; **re-run** after changing `config.py`):
 
-Per-class accuracies:
-
-| Class        | Index | Accuracy |
-|--------------|:-----:|---------:|
-| Decreasing   | 0     | 0.7293   |
-| Stable       | 1     | 0.8842   |
-| Increasing   | 2     | 0.0852   |
+| Metric | Example |
+|--------|--------|
+| Accuracy | ~0.49 |
+| Macro F1 | ~0.45 |
 
 ---
 
 ## How to Run
 
-**Prerequisites**: Python 3.10+, Data at `../Datasets/Abilene/2004/Measured/` (or preprocessed `data/abilene_2004_Tx12x12.npy`).
-
-**Create virtual environment and install dependencies (recommended):**
+**Prerequisites:** Python 3.10+, data at `../Datasets/Abilene/2004/Measured/` or `Netflux/data/abilene_2004_Tx12x12.npy`.
 
 ```bash
-cd traffic_forecasting
+cd Netflux
 
-# Create virtual environment
+# Optional: virtual environment
 python3 -m venv .venv
-
-# Activate (macOS/Linux)
-source .venv/bin/activate
-
-# Install latest dependencies
+source .venv/bin/activate   # macOS/Linux
 pip install --upgrade pip
 pip install -r requirements.txt
 ```
@@ -131,45 +159,72 @@ pip install -r requirements.txt
 **Train and evaluate:**
 
 ```bash
-# Train CNN-LSTM (early stopping, best model saved to checkpoints/)
-python train.py
-
-# Evaluate best model and baselines (accuracy, macro F1, confusion matrix)
-python evaluate.py
+python train.py    # saves best checkpoint to checkpoints/best_cnn_lstm.pt
+python evaluate.py   # loads checkpoint, reports metrics
 ```
 
-- Training curves are saved to `outputs/training_curves.png`.
-- Test metrics are printed and written to `outputs/test_metrics.txt`.
+Optional: **`python experiments/threshold_sweep.py`** — class distribution vs relative thresholds (uses same aggregation as config).
+
+- Training curves: `outputs/training_curves.png`
+- Test metrics: `outputs/test_metrics.txt`
 
 ---
 
 ## Project Structure
 
 ```
-traffic_forecasting/
-├── DATA (reference: ../Datasets/Abilene/2004)
-├── config.py           # Paths, hyperparameters, seed
-├── dataset.py          # Load (T,12,12), sliding window, chronological split
-├── baselines.py        # Persistence and mean-of-last-k
-├── models/
-│   └── cnn_lstm.py     # CNN-LSTM regression + classifier
-├── utils/
-│   ├── metrics.py      # Regression (MSE/RMSE/MAE) + classification (accuracy, F1, confusion)
-│   ├── scaler.py       # Standardization (fit on train, save/load)
-│   └── visualization.py
-├── train.py            # Training loop, early stopping
-├── evaluate.py         # Load best model, run baselines, report metrics
-├── checkpoints/        # Best model checkpoint
-├── outputs/            # Plots and metric logs
-├── data/               # Optional: preprocessed .npy
-└── README.md
+Final Project/
+├── Datasets/Abilene/2004/   # data (reference path in config)
+└── Netflux/
+    ├── config.py
+    ├── dataset.py            # load, aggregate_matrices, sliding window, labels
+    ├── baselines.py
+    ├── train.py
+    ├── evaluate.py
+    ├── diagnose.py
+    ├── experiments/
+    │   └── threshold_sweep.py
+    ├── models/
+    │   └── cnn_lstm.py       # PerLinkLSTM (+ legacy names)
+    ├── utils/
+    ├── checkpoints/
+    ├── outputs/
+    ├── data/                 # optional preprocessed .npy
+    └── requirements.txt
 ```
 
 ---
 
 ## Future Improvements
 
-- **Transformer**: Replace LSTM with a temporal Transformer over CNN-derived tokens; add positional encoding.
-- **GNN**: Model the Abilene topology as a graph; use GNN layers for spatial aggregation and a temporal module (LSTM/Transformer) for forecasting.
-- **RPCA / PCA**: Low-rank or robust PCA on the traffic matrix time series for denoising or as a feature front-end.
-- **Multi-step forecasting**: Predict several future matrices (e.g. \(M_{t+1}, \ldots, M_{t+h}\)) with a single model or autoregressive setup.
+- **Transformer** over per-link or matrix-level tokens.
+- **GNN** if explicit topology is available (Abilene graph).
+- **RPCA / PCA** as a denoising front-end.
+- **Multi-step** horizons (predict \(t \to t+h\)) via `HORIZON` in dataset/config if you add it.
+
+---
+
+## Evolution of the Approach
+
+### 1. Why We Switched from Absolute to Relative Tolerance
+
+Fixed absolute thresholds are not comparable across links with very different traffic scales. **Relative (percentage) labeling** with **`TOLERANCE = 0.1`** (10%) makes “stable” vs “up/down” comparable across the matrix.
+
+### 2. Why Per-Link LSTM Instead of CNN-LSTM
+
+A 12×12 matrix is not a natural image; **Per-Link LSTM** treats each OD pair as its own time series with a **shared** LSTM, avoiding false spatial convolutions.
+
+**Input alignment:** Features are percentage changes (with **`pct_floor`** and **±3.0** clip) consistent with relative labels.
+
+### 3. Training Stack (matches `config.py`)
+
+- Balanced class weights, Adam with **weight decay**, **gradient clipping**, early stopping (**patience 15** in current config).
+- **Dropout 0.3**, **hidden size 128** — tuned for longer windows (`WINDOW_SIZE = 10`).
+
+### 4. Temporal Aggregation (30-Minute Windows)
+
+With **`AGGREGATION_STEPS = 6`**, five-minute snapshots are averaged into **30-minute** steps before labeling and windows. Set **`AGGREGATION_STEPS = 1`** to train on full 5-minute resolution. **`WINDOW_SIZE = 10`** is then **10** coarse steps of history (≈ **5 hours** at 30-minute resolution).
+
+### 5. Latest Results (Test Set)
+
+Run **`python evaluate.py`** and read **`outputs/test_metrics.txt`** for metrics that match your current **`config.py`** and checkpoint. Older reported figures (e.g. accuracy ~0.49, macro F1 ~0.45) were from a **5-minute** pipeline; after switching to **30-minute aggregation** and the **wider window / larger LSTM**, **re-train and re-evaluate** and paste updated numbers here if you want them fixed in the README.
