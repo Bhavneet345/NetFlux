@@ -22,7 +22,7 @@ SCALER_PATH = CHECKPOINT_DIR / "scaler.npz"
 # Data
 # -----------------------------------------------------------------------------
 MATRIX_SIZE = 12   # 12x12 traffic matrix
-WINDOW_SIZE = 10   # 10 windows × 30min = 5 hours of history → 9 delta frames
+WINDOW_SIZE = 10   # 10 raw matrices → 9 deltas + mean + var frames = 11 LSTM timesteps (see dataset.py)
 TRAIN_RATIO = 0.70
 VAL_RATIO = 0.15
 TEST_RATIO = 0.15
@@ -33,7 +33,7 @@ AGGREGATION_STEPS = 6
 
 # Classification (link trend: Decreasing / Stable / Increasing)
 LABEL_MODE = "relative"   # "absolute" or "relative"
-TOLERANCE = 0.1         # 10% relative change
+TOLERANCE = 0.15        # 15% relative change (Stable if |Δ| ≤ this)
 EPSILON = 1e-9            # div-by-zero protection
 NUM_CLASSES = 3           # 0=Decreasing, 1=Stable, 2=Increasing
 CLASS_WEIGHTS = "balanced"
@@ -41,6 +41,8 @@ CLASS_WEIGHTS = "balanced"
 # -----------------------------------------------------------------------------
 # Model (Per-Link LSTM — CNN params kept for any legacy imports)
 # -----------------------------------------------------------------------------
+USE_GNN = True  # True: GCN over Abilene topology before LSTM; False: original Linear(1→16) projection
+
 CNN_OUT_CHANNELS = 32    # unused by PerLinkLSTM, kept for import compatibility
 CNN_KERNEL_SIZE = 3      # unused by PerLinkLSTM, kept for import compatibility
 LSTM_HIDDEN_SIZE = 128   # increased: more context (10 windows) needs more capacity

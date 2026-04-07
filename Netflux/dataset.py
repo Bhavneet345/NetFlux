@@ -62,7 +62,7 @@ def load_abilene_matrices(data_dir: Optional[Path] = None) -> np.ndarray:
 def aggregate_matrices(data: np.ndarray, steps: int) -> np.ndarray:
     """
     Temporal aggregation: average every `steps` consecutive matrices.
-    (T, 12, 12) -> (T//steps, 12, 12). With 5-min raw data, steps=6 -> 30-min resolution.
+    (T, 12, 12) -> (T // steps, 12, 12). With 5-min raw data, steps=6 -> 30-min resolution.
     """
     if steps <= 1:
         return data
@@ -119,8 +119,13 @@ def get_class_distribution(
 class TrafficMatrixDataset(Dataset):
     """
     Sliding-window dataset.
-    Classification: input (k, 12, 12), target (12, 12) of labels 0/1/2.
-    Regression (classification=False): input (k, 12, 12), target (12, 12) float; optional scaler.
+
+    Classification, relative mode: input (window_size + 1, 12, 12) — (window_size - 1) delta
+    frames plus mean and variance summary frames (Javadtalab et al. 2015); target (12, 12) int.
+
+    Classification, absolute mode: input (window_size, 12, 12) raw matrices; same target.
+
+    Regression: input (window_size, 12, 12), target (12, 12) float; optional scaler.
     """
 
     def __init__(
@@ -151,16 +156,10 @@ class TrafficMatrixDataset(Dataset):
         self.relative = relative
         self.epsilon = epsilon
 
-        # Data-relative denominator floor for percentage changes:
-        # 1% of the 10th percentile of non-zero values in the dataset.
-        if relative:
-            nonzero = data[data > 0]
-            if len(nonzero) > 0:
-                self.pct_floor = float(np.percentile(nonzero, 10) * 0.01)
-            else:
-                self.pct_floor = epsilon
-        else:
-            self.pct_floor = epsilon
+        # Denominator floor for percentage changes: 1% of the 10th percentile of
+        # positive entries (scales with data units; avoids exploding deltas on tiny loads).
+        nonzero = data[data > 0]
+        self.pct_floor = float(np.percentile(nonzero, 10)) * 0.01 if len(nonzero) > 0 else epsilon
         self.T = data.shape[0]
         if classification:
             # Need M[t] and M[t+1]; t from window_size to T-2
@@ -181,10 +180,19 @@ class TrafficMatrixDataset(Dataset):
                 relative=self.relative, epsilon=self.epsilon,
             )
             if self.relative:
-                # Feed percentage changes instead of raw values: (k-1, 12, 12)
-                # pct_floor is data-relative: 1% of 10th-percentile non-zero traffic
-                seq = np.diff(seq, axis=0) / (np.abs(seq[:-1]) + self.pct_floor)
-                np.clip(seq, -3.0, 3.0, out=seq)
+                seq_raw = seq.copy()
+                deltas = np.diff(seq_raw, axis=0) / (np.abs(seq_raw[:-1]) + self.pct_floor)
+                np.clip(deltas, -3.0, 3.0, out=deltas)        # (k-1, 12, 12)
+
+                # Professor Abbas's mean+variance approach (Javadtalab et al. 2015)
+                # Mean: captures sustained direction of change per link
+                # Variance: captures stability/noise level of that change
+                mu = deltas.mean(axis=0, keepdims=True)  # (1, 12, 12)
+                var = ((deltas - mu) ** 2).mean(axis=0, keepdims=True)  # (1, 12, 12)
+
+                # Append as two explicit summary frames after the raw deltas
+                # LSTM sees: [δ1, δ2, ..., δ(k-1), mean_frame, variance_frame]
+                seq = np.concatenate([deltas, mu, var], axis=0)  # (k+1, 12, 12)
             if self.scaler is not None:
                 seq = self.scaler.transform(seq)
             return (
@@ -225,3 +233,11 @@ if __name__ == "__main__":
     x, y = ds[0]
     print("Classification sample seq shape:", x.shape, "target shape:", y.shape, "dtype:", y.dtype)
     print("Label counts:", np.bincount(y.numpy().ravel(), minlength=3))
+
+    # Test mean+variance frames
+    x, y = ds[0]
+    T = x.shape[0]
+    print(f"Sequence length with mean+var frames: {T}")
+    print(f"Expected: WINDOW_SIZE-1+2 = {WINDOW_SIZE + 1}")
+    assert T == WINDOW_SIZE + 1, f"Wrong T: {T}"
+    print("Mean+variance frame test passed")

@@ -4,6 +4,20 @@ NetFlux is a **link-trend classification** pipeline for backbone traffic matrice
 
 ---
 
+## How it works (plain English)
+
+1. **Smooth time:** Raw Abilene data is every **5 minutes**. By default we **average 6 snapshots** so each step is **30 minutes** — less noise, clearer trends (`aggregate_matrices` in `dataset.py`; `AGGREGATION_STEPS` in `config.py`).
+
+2. **Fair labels:** We don’t use one fixed traffic amount for “big change” (that punishes small links). We use **percentage change** from the current step to the next. If the move is **small** (within **`TOLERANCE`**, see config), the label is **Stable**; otherwise **Increasing** or **Decreasing**.
+
+3. **What the network sees:** For each link we don’t feed raw Gbps. We feed **step-to-step percentage changes** over a **history window** (`WINDOW_SIZE` raw matrices). From those we build **deltas**, clip extremes, then add **two extra time steps** computed from those deltas only (not loaded from disk): **short-term** = average of the **last 3** deltas (recent momentum), **long-term** = average of **all** deltas in the window (overall direction). So with `WINDOW_SIZE = 10` you get **9 + 2 = 11** LSTM timesteps per link.
+
+4. **Per-Link LSTM:** The 12×12 grid is **not** an image. Each of **144 links** is its own tiny time series; a **shared** LSTM reads that link’s 11 values and outputs one of three classes. Same weights for every link.
+
+5. **Training:** Weighted loss (balanced classes), Adam, weight decay, gradient clipping, early stopping on validation loss.
+
+---
+
 ## Project Overview
 
 This repository (`Netflux/`) implements:
@@ -25,10 +39,10 @@ Values below are the single source of truth; update this table when you change `
 | Setting | Value | Notes |
 |--------|-------|--------|
 | `MATRIX_SIZE` | 12 | 12×12 traffic matrix |
-| `WINDOW_SIZE` | **10** | 10 matrices of history; with 30-min aggregation ≈ **5 hours** of context |
+| `WINDOW_SIZE` | **10** | 10 raw matrices per sample; **11** LSTM steps in relative mode (9 deltas + 2 summaries); ~**4.5 h** span at 30-min resolution (9 gaps × 30 min) |
 | `AGGREGATION_STEPS` | **6** | 5 min × 6 = **30-minute** timesteps; set to `1` for raw 5-minute data |
 | `LABEL_MODE` | `"relative"` | Per-link % change vs `|M_curr| + ε` |
-| `TOLERANCE` | **0.1** | **10%** relative change → Stable band |
+| `TOLERANCE` | **0.15** | **15%** relative change: Stable if \(|\Delta| \le\) this (change in `config.py` as needed) |
 | `EPSILON` | `1e-9` | Denominator floor in relative formulas |
 | `CLASS_WEIGHTS` | `"balanced"` | Inverse-frequency weights in CrossEntropyLoss |
 | `LSTM_HIDDEN_SIZE` | **128** | Per-link LSTM hidden size |
@@ -42,7 +56,7 @@ Values below are the single source of truth; update this table when you change `
 | `TRAIN_RATIO` / `VAL_RATIO` / `TEST_RATIO` | 0.70 / 0.15 / 0.15 | Chronological, no shuffle |
 | `SEED` | 42 | Reproducibility |
 
-**Relative mode inputs:** After aggregation, each sample uses `WINDOW_SIZE` raw matrices in the window; the dataset converts them to **percentage-change frames** along time (`WINDOW_SIZE - 1` frames, e.g. **9** when `WINDOW_SIZE = 10`).
+**Relative mode inputs:** `WINDOW_SIZE` **raw** matrices are loaded (e.g. **10**). Inside `__getitem__` these become **`WINDOW_SIZE - 1` percentage-change deltas** (e.g. **9**), plus **two synthetic timesteps** — short-term (mean of last 3 deltas) and long-term (mean of all deltas) — **not** read from disk. The LSTM receives **`(WINDOW_SIZE - 1) + 2 = WINDOW_SIZE + 1`** timesteps (e.g. **11** when `WINDOW_SIZE = 10`).
 
 ---
 
@@ -62,7 +76,7 @@ Values below are the single source of truth; update this table when you change `
 ## Classification Formulation
 
 - **Why classification**: We predict each link’s **trend** (Decreasing / Stable / Increasing) instead of raw values — useful for alerts and interpretability.
-- **Label definition (relative mode, default):** For each link, \(\Delta = (M_{next} - M_{curr}) / (|M_{curr}| + \epsilon)\). With **`TOLERANCE = 0.1` (10%)**:
+- **Label definition (relative mode, default):** For each link, \(\Delta = (M_{next} - M_{curr}) / (|M_{curr}| + \epsilon)\). With **`TOLERANCE`** from `config.py` (e.g. **0.15** = 15%):
   - **Stable (1)** if \(|\Delta| \le \text{TOLERANCE}\)
   - **Increasing (2)** if \(\Delta > \text{TOLERANCE}\)
   - **Decreasing (0)** if \(\Delta < -\text{TOLERANCE}\)
@@ -73,7 +87,7 @@ Values below are the single source of truth; update this table when you change `
 
 ## Problem Formulation
 
-- **Input**: A sequence of `WINDOW_SIZE` past matrices → in relative mode, **percentage-change** tensor of shape **`(WINDOW_SIZE - 1, 12, 12)`** per sample.
+- **Input**: In relative mode, **`(WINDOW_SIZE + 1, 12, 12)`** — **`WINDOW_SIZE - 1`** delta frames plus **short-term** and **long-term** summary frames (see `dataset.py`).
 - **Output**: A 12×12 matrix of class labels (0, 1, 2) for the transition to the next timestep.
 - **Objective**: Minimize weighted cross-entropy; report accuracy and macro F1. **144** independent 3-way decisions per sample (one per link).
 
@@ -91,7 +105,7 @@ Values below are the single source of truth; update this table when you change `
 
 Implemented in `models/cnn_lstm.py` as `PerLinkLSTM` (also exported as `CNNLSTMClassifier` for compatibility).
 
-1. **Reshape** `(B, T, 12, 12)` → `(B×144, T, 1)` so each link is its own batch item.
+1. **Reshape** `(B, T, 12, 12)` → `(B×144, T, 1)` so each link is its own batch item (`T = WINDOW_SIZE + 1` in relative mode, e.g. **11** when `WINDOW_SIZE = 10`).
 2. **Input projection:** `Linear(1 → 16)`, `LayerNorm`, `tanh`.
 3. **LSTM:** `LSTM_NUM_LAYERS` layers, hidden size `LSTM_HIDDEN_SIZE` (**128**), `batch_first=True`, dropout between layers when `num_layers > 1`.
 4. **Last timestep** → `Dropout` → `Linear(hidden → 3)` per link.
@@ -208,13 +222,15 @@ Final Project/
 
 ### 1. Why We Switched from Absolute to Relative Tolerance
 
-Fixed absolute thresholds are not comparable across links with very different traffic scales. **Relative (percentage) labeling** with **`TOLERANCE = 0.1`** (10%) makes “stable” vs “up/down” comparable across the matrix.
+Fixed absolute thresholds are not comparable across links with very different traffic scales. **Relative (percentage) labeling** (see **`TOLERANCE`** in `config.py`) makes “stable” vs “up/down” comparable across the matrix.
 
 ### 2. Why Per-Link LSTM Instead of CNN-LSTM
 
 A 12×12 matrix is not a natural image; **Per-Link LSTM** treats each OD pair as its own time series with a **shared** LSTM, avoiding false spatial convolutions.
 
-**Input alignment:** Features are percentage changes (with **`pct_floor`** and **±3.0** clip) consistent with relative labels.
+**Input alignment:** Features are percentage changes (with **`pct_floor`** = 1% of the 10th percentile of positive traffic, and **±3.0** clip) consistent with relative labels.
+
+**Trend summaries:** Two extra timesteps per link — **short-term** (mean of last 3 deltas) and **long-term** (mean of all deltas in the window) — give the LSTM explicit multi-scale context without changing the label rule.
 
 ### 3. Training Stack (matches `config.py`)
 
@@ -223,7 +239,7 @@ A 12×12 matrix is not a natural image; **Per-Link LSTM** treats each OD pair as
 
 ### 4. Temporal Aggregation (30-Minute Windows)
 
-With **`AGGREGATION_STEPS = 6`**, five-minute snapshots are averaged into **30-minute** steps before labeling and windows. Set **`AGGREGATION_STEPS = 1`** to train on full 5-minute resolution. **`WINDOW_SIZE = 10`** is then **10** coarse steps of history (≈ **5 hours** at 30-minute resolution).
+With **`AGGREGATION_STEPS = 6`**, five-minute snapshots are averaged into **30-minute** steps before labeling and windows. Set **`AGGREGATION_STEPS = 1`** to train on full 5-minute resolution. **`WINDOW_SIZE = 10`** loads **10** consecutive coarse matrices; the model sees **11** timesteps per link after delta + short/long features.
 
 ### 5. Latest Results (Test Set)
 
