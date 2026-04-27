@@ -226,7 +226,7 @@ def get_classifier(device: torch.device) -> PerLinkLSTM:
 if __name__ == "__main__":
     device = torch.device("cpu")
     model = PerLinkLSTM()
-    x = torch.randn(4, 11, 12, 12)  # 9 deltas + mean frame + variance frame (matches dataset)
+    x = torch.randn(4, 11, 12, 12)  # 9 deltas + Pareto x_m + α (matches relative dataset)
     out = model(x)
     assert out.shape == (4, 3, 12, 12), f"Wrong shape: {out.shape}"
     print("Shape check passed:", out.shape)

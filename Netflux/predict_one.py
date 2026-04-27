@@ -1,7 +1,8 @@
 """
-Single-sample inspection for the CNN-LSTM classifier.
-Given one test window (k past matrices), show predicted vs actual trend labels
-for the next 12x12 traffic matrix and basic metrics for that sample.
+Single-sample inspection for the Per-Link LSTM classifier (`CNNLSTMClassifier`).
+
+Given one test window, shows predicted vs actual per-link trend labels for the
+next 12×12 traffic matrix and basic metrics for that sample.
 """
 
 import numpy as np

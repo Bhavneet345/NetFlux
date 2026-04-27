@@ -120,8 +120,8 @@ class TrafficMatrixDataset(Dataset):
     """
     Sliding-window dataset.
 
-    Classification, relative mode: input (window_size + 1, 12, 12) — (window_size - 1) delta
-    frames plus mean and variance summary frames (Javadtalab et al. 2015); target (12, 12) int.
+    Classification, relative mode: input (window_size + 1, 12, 12) — (window_size - 1) signed
+    delta frames plus two Pareto MLE summary frames (scale x_m, shape α); target (12, 12) int.
 
     Classification, absolute mode: input (window_size, 12, 12) raw matrices; same target.
 
@@ -184,15 +184,28 @@ class TrafficMatrixDataset(Dataset):
                 deltas = np.diff(seq_raw, axis=0) / (np.abs(seq_raw[:-1]) + self.pct_floor)
                 np.clip(deltas, -3.0, 3.0, out=deltas)        # (k-1, 12, 12)
 
-                # Professor Abbas's mean+variance approach (Javadtalab et al. 2015)
-                # Mean: captures sustained direction of change per link
-                # Variance: captures stability/noise level of that change
-                mu = deltas.mean(axis=0, keepdims=True)  # (1, 12, 12)
-                var = ((deltas - mu) ** 2).mean(axis=0, keepdims=True)  # (1, 12, 12)
+                # Professor Abbas's Pareto distribution approach (Javadtalab et al. 2015)
+                # |Δ| per link; Pareto MLE scale and shape as two summary frames.
+                # Use absolute values because Pareto is defined for positive values only.
+                abs_deltas = np.abs(deltas) + 1e-8   # (k-1, 12, 12) strictly positive
 
-                # Append as two explicit summary frames after the raw deltas
-                # LSTM sees: [δ1, δ2, ..., δ(k-1), mean_frame, variance_frame]
-                seq = np.concatenate([deltas, mu, var], axis=0)  # (k+1, 12, 12)
+                # Pareto MLE estimates (Javadtalab et al. 2015)
+                # Scale parameter x_m: minimum value in window per link
+                # Shape parameter alpha: MLE estimate from window observations
+                n = abs_deltas.shape[0]   # number of delta frames (k-1 = 9)
+
+                x_m = abs_deltas.min(axis=0, keepdims=True)          # (1, 12, 12) scale
+                x_m = np.maximum(x_m, 1e-8)                          # floor
+
+                log_ratios = np.log(abs_deltas / x_m + 1e-8)         # (k-1, 12, 12)
+                alpha = n / (log_ratios.sum(axis=0, keepdims=True) + 1e-8)  # (1, 12, 12) shape
+
+                # Clip alpha to reasonable range (Pareto shape typically 0.5 - 10)
+                alpha = np.clip(alpha, 0.1, 10.0)
+
+                # Append x_m (scale) and alpha (shape) as two summary frames
+                # Sequence: [δ1, δ2, ..., δ(k-1), x_m_frame, alpha_frame]
+                seq = np.concatenate([deltas, x_m, alpha], axis=0)  # (k+1, 12, 12)
             if self.scaler is not None:
                 seq = self.scaler.transform(seq)
             return (
@@ -234,10 +247,10 @@ if __name__ == "__main__":
     print("Classification sample seq shape:", x.shape, "target shape:", y.shape, "dtype:", y.dtype)
     print("Label counts:", np.bincount(y.numpy().ravel(), minlength=3))
 
-    # Test mean+variance frames
+    # Test Pareto MLE (x_m, alpha) summary frames
     x, y = ds[0]
     T = x.shape[0]
-    print(f"Sequence length with mean+var frames: {T}")
+    print(f"Sequence length with Pareto MLE frames: {T}")
     print(f"Expected: WINDOW_SIZE-1+2 = {WINDOW_SIZE + 1}")
     assert T == WINDOW_SIZE + 1, f"Wrong T: {T}"
-    print("Mean+variance frame test passed")
+    print("Dataset sequence-length check passed")

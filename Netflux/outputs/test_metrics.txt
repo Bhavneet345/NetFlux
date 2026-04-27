@@ -1,12 +1,12 @@
-Accuracy: 0.50
+Accuracy: 0.49
 F1 per class:
-  Decreasing: 0.38
-  Stable: 0.63
-  Increasing: 0.40
-Macro F1:   0.47
-Per-class precision: [np.float64(0.34217528017415144), np.float64(0.707094204008859), np.float64(0.36723703978303707)]
-Per-class recall: [np.float64(0.43200325732899025), np.float64(0.5651510765736679), np.float64(0.43231200330745556)]
+  Decreasing: 0.40
+  Stable: 0.62
+  Increasing: 0.35
+Macro F1:   0.46
+Per-class precision: [np.float64(0.32609376958756425), np.float64(0.7126264899316193), np.float64(0.36745827181501967)]
+Per-class recall: [np.float64(0.5295704397394136), np.float64(0.5464696844870967), np.float64(0.3372685929532822)]
 Confusion matrix:
-[[16976  9657 12663]
- [19291 50763 19768]
- [13345 11371 18822]]
+[[20810  9014  9472]
+ [24932 49085 15805]
+ [18074 10780 14684]]

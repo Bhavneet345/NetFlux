@@ -1,5 +1,9 @@
 """
-Evaluation script: load best classifier, report CNN-LSTM accuracy.
+Evaluation script: load the best Per-Link LSTM checkpoint and report test metrics.
+
+Writes `outputs/test_metrics.txt`. For the transformer pipeline, see metrics from
+`train_rl.py` (`outputs/rl_test_metrics.txt`) or run your own eval on
+`checkpoints/best_transformer.pt`.
 """
 
 from pathlib import Path
@@ -55,9 +59,9 @@ def evaluate_checkpoint_and_return_metrics(
             all_pred.append(pred)
             all_target.append(target.to(device))
 
-    pred_cnn = torch.cat(all_pred, dim=0)
+    pred = torch.cat(all_pred, dim=0)
     target_t = torch.cat(all_target, dim=0)
-    return compute_classification_metrics(pred_cnn, target_t, num_classes=num_classes)
+    return compute_classification_metrics(pred, target_t, num_classes=num_classes)
 
 
 def main() -> None:
