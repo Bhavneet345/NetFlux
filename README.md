@@ -1,4 +1,4 @@
-# NetFlux: Per-Link Traffic Trend Classification on Abilene 2004
+# NETFLUX: PER-LINK TRAFFIC TREND CLASSIFICATION USING A SPATIAL-TEMPORAL TRANSFORMER AND REINFORCE FINE-TUNING
 
 NetFlux is an end-to-end **link-trend classification** pipeline for backbone Internet traffic matrices. Given a sliding window of past 12×12 origin-destination (OD) matrices, the model independently predicts for each of the **144 links** whether traffic will be **Decreasing (0)**, **Stable (1)**, or **Increasing (2)** at the next timestep.
 
